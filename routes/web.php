@@ -23,9 +23,12 @@ Route::post('/login', function (Request $request) {
     return back();
 });
 
-Route::middleware('auth')->group(function () {
-    Route::get('/admin', function () { return view('admin'); });
-    Route::get('/admin/{any}', function () { return view('admin'); })->where('any', '.*');
-});
+//Route::middleware('auth')->group(function () {
+//    Route::get('/admin', function () { return view('admin'); });
+//    Route::get('/admin/{any}', function () { return view('admin'); })->where('any', '.*');
+//});
+
+Route::get('/admin', function () { return view('admin'); });
+Route::get('/admin/{any}', function () { return view('admin'); })->where('any', '.*');
 
 Route::get('/{any}', function ($any) { return view('app'); })->where('any', '.*');

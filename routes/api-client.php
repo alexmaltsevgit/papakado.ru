@@ -1,7 +1,10 @@
 <?php
 
 use App\Http\Resources\Client\BannerResource;
+use App\Mail\ErrorEmail;
+use App\Models\Delivery\DeliveryPickup;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Route;
 
 use App\Models\Product;
@@ -27,7 +30,7 @@ Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
 });
 
-// 
+//
 
 Route::get('/settings', function() {
     return SettingResource::collection( Setting::all() );
@@ -53,7 +56,7 @@ Route::get('/products', function() {
     return ProductResource::collection( Product::all() );
 });
 
-// 
+//
 
 Route::get('/banners', function() {
     return BannerResource::collection( Banner::orderBy('order', 'ASC')->get() );
@@ -68,7 +71,7 @@ Route::get('/coupons/{value}/check', function($value) {
     return response()->json([ 'data' => null ]);
 });
 
-// 
+//
 
 Route::post('/order/submit', function(Request $request) {
     $data = $request->all();
@@ -79,7 +82,7 @@ Route::post('/order/submit', function(Request $request) {
     $order->save();
 
     // append products
-    foreach ($data['products'] as $product) 
+    foreach ($data['products'] as $product)
         $order->products()->attach($product['id'], [ 'quantity' => $product['quantity'] ]);
 
     // increase sales count for each product
@@ -91,16 +94,131 @@ Route::post('/order/submit', function(Request $request) {
     $order->append_delivery($data['delivery']);
     $order->append_payment($data['payment']);
 
-    // 
+    if (env('APP_DEBUG') === false) {
+        Mail::to("info@papakado.ru")->send( new OrderEmail($order) );
+    }
 
-    // Mail::to("info@papakado.ru")->send( new OrderEmail($order) );
-
-    // 
 
     $target_url = env('APP_URL') . '/order/' . $order->id;
 
+    /*********************/
+    /* SBIS DELIVERY API */
+    /*********************/
+    $app_id = env("SBIS_APP_ID");
+    $protected_key = env("SBIS_PROTECTED_KEY");
+    $service_key = env("SBIS_SERVICE_KEY");
+
+    $sbis_auth_url = "https://online.sbis.ru/oauth/service/";
+
+    $sbis_auth_response = Http::post($sbis_auth_url, [
+        "app_client_id" => $app_id,
+        "app_secret" => $protected_key,
+        "secret_key" => $service_key
+    ]);
+
+    if ($sbis_auth_response->successful()) {
+        $sbis_token = $sbis_auth_response->json()['token'];
+
+        try {
+            $sale_point_id = Http::withHeaders([
+                "X-SBISAccessToken" => $sbis_token
+            ])->get("https://api.sbis.ru/retail/point/list")
+                ->json()["salesPoints"][0]["id"];
+
+            $price_list_id = 8; // In the future, make http request to get needed price list. Hardcode is fine for now.
+
+            $nomenclatures = [];
+            foreach ($order->products as $product) {
+                $product_name = $product->name;
+                $nomenclature_list_url =
+                    "https://api.sbis.ru/retail/nomenclature/list?" .
+                    "pointId=$sale_point_id&" .
+                    "priceListId=$price_list_id&" .
+                    "searchString=$product_name";
+
+                $found_nomenclatures = Http::withHeaders([
+                    "X-SBISAccessToken" => $sbis_token
+                ])->get($nomenclature_list_url)->json()["nomenclatures"];
+
+                foreach ($found_nomenclatures as $nomenclature) {
+                    if ($nomenclature['id'] !== null) {
+                        array_push($nomenclatures, [
+                            "id" => $nomenclature['id'],
+                            "count" => $product->pivot->quantity,
+                            "priceListId" => $price_list_id
+                        ]);
+                        break;
+                    }
+                }
+            }
+
+            $isPickup = get_class($order->delivery->delivered) === DeliveryPickup::class;
+            $delivery_data = $order->delivery->GetDeliveredClientResourceAttribute();
+
+            $city = "Санкт-Петербург";
+            $street = $delivery_data->street;
+            $house = $delivery_data->house;
+
+            $isOnlinePayment = get_class($order->payment->paid) === PaymentOnline::class;
+
+            $delivery = [
+                "isPickup" => false
+            ];
+
+            if ($isOnlinePayment) {
+                $delivery['paymentType'] = "online";
+                $delivery['shopURL'] = env('APP_URL');
+                $delivery['successURL'] = env('APP_URL');
+                $delivery['errorURL'] = env('APP_URL');
+            }
+
+            if ($isPickup) {
+                $delivery['isPickup'] = true;
+                $delivery['addressFull'] = "$city $street $house";
+                $delivery['addressJSON'] = json_encode([
+                    "City" => $city,
+                    "Street" => $street,
+                    "HouseNum" => $house
+                ]);
+            }
+
+            $sbis_delivery_response = Http::withHeaders([
+                "X-SBISAccessToken" => $sbis_token
+            ])->post('https://api.sbis.ru/retail/order/create', [
+                "product" => "delivery",
+                "pointId" => $sale_point_id,
+                "comment" => $order->delivery->comment ?: "",
+                "customer" => [
+                    "name" => $order->delivery->name,
+                    "phone" => $order->delivery->phone
+                ],
+                "datetime" => date('Y-m-d H:i:s'),
+                "nomenclatures" => $nomenclatures,
+                "delivery" => $delivery
+            ]);
+
+            throw_if($sbis_delivery_response->failed());
+        } catch (Exception $e) {
+            if (env('APP_DEBUG') === false) {
+                Mail::to("info@papakado.ru")->send(new ErrorEmail($e));
+            }
+        } finally {
+            $exit_url = "https://online.sbis.ru/oauth/service/";
+            Http::withHeaders([
+                "X-SBISAccessToken" => $sbis_token
+            ])->post($exit_url, [
+                "event" => "exit",
+                "token" => $sbis_token
+            ]);
+        }
+    }
+    /*********************/
+    /* END OF            */
+    /* SBIS DELIVERY API */
+    /*********************/
+
     if ( get_class($order->payment->paid) === PaymentOnline::class )
-    {   
+    {
         $url = 'https://3dsec.sberbank.ru/payment/rest/register.do';
         $data = [
             'userName' => env('SBER_API_NAME'),
@@ -119,7 +237,7 @@ Route::post('/order/submit', function(Request $request) {
             ]
         ];
         $context  = stream_context_create($options);
-        
+
         $result = file_get_contents($url, false, $context);
         $result_data = json_decode($result, true);
 
@@ -139,7 +257,7 @@ Route::post('/order/submit', function(Request $request) {
     ]);
 });
 
-// 
+//
 
 Route::get('/orders/{id}', function ($id) {
     $order = Order::find($id);
@@ -164,7 +282,7 @@ Route::post('/orders/{id}/payment/online/check-status', function(Request $reques
         ]
     ];
     $context  = stream_context_create($options);
-    
+
     $result = file_get_contents($url, false, $context);
     $result_data = json_decode($result, true);
 
